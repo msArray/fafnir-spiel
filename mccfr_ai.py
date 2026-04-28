@@ -10,9 +10,11 @@ from typing import Dict, List, Tuple, Optional, DefaultDict
 from collections import defaultdict
 import random
 import copy
+import multiprocessing as mp
 from dataclasses import dataclass, field
 import pickle
 import os
+import tempfile
 
 
 @dataclass
@@ -95,8 +97,65 @@ class MCCFRSolver:
             self.nodes[info_state] = NodeInfo(info_state=info_state)
         return self.nodes[info_state]
 
-    def run_mccfr(self, num_iterations: int = 1000):
-        """Run MCCFR iterations."""
+    def run_mccfr(
+        self,
+        num_iterations: int = 1000,
+        num_workers: int = 1,
+        show_progress: bool = True,
+    ):
+        """Run MCCFR iterations (optionally in parallel workers)."""
+        if num_iterations <= 0:
+            return
+
+        if num_workers is None or num_workers <= 1:
+            self._run_mccfr_serial(num_iterations, show_progress=show_progress)
+            return
+
+        max_workers = os.cpu_count() or 1
+        worker_count = min(max_workers, max(1, int(num_workers)))
+        if worker_count == 1:
+            self._run_mccfr_serial(num_iterations, show_progress=show_progress)
+            return
+
+        counts = _split_iterations(num_iterations, worker_count)
+        if len(counts) <= 1:
+            self._run_mccfr_serial(num_iterations, show_progress=show_progress)
+            return
+
+        seeds = [random.randint(0, 2**31 - 1) for _ in counts]
+        jobs = [
+            (
+                self.game_class,
+                count,
+                self.learning_rate,
+                self.exploration_bonus,
+                self.max_depth,
+                seeds[i],
+            )
+            for i, count in enumerate(counts)
+        ]
+
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(processes=len(jobs)) as pool:
+            results = pool.map(_mccfr_worker, jobs)
+
+        for nodes, iterations, payoff_sum in results:
+            self._merge_worker_result(nodes, iterations, payoff_sum)
+
+        if show_progress:
+            avg_utility_0 = (
+                self.payoff_sum[0] / self.iterations if self.iterations else 0.0
+            )
+            avg_utility_1 = (
+                self.payoff_sum[1] / self.iterations if self.iterations else 0.0
+            )
+            print(
+                f"[MCCFR] Parallel run +{num_iterations} iters "
+                f"({len(jobs)} workers) - Nodes: {len(self.nodes)} - "
+                f"P0 util: {avg_utility_0:.4f}, P1 util: {avg_utility_1:.4f}"
+            )
+
+    def _run_mccfr_serial(self, num_iterations: int, show_progress: bool = True):
         for iteration in range(num_iterations):
             state = self.game_class().new_initial_state()
             utilities = self._mccfr_iteration(state, [1.0, 1.0], 0)
@@ -104,14 +163,36 @@ class MCCFRSolver:
             self.payoff_sum[1] += utilities[1]
             self.iterations += 1
 
-            if (iteration + 1) % 100 == 0:
-                avg_utility_0 = self.payoff_sum[0] / (iteration + 1)
-                avg_utility_1 = self.payoff_sum[1] / (iteration + 1)
+            if show_progress and (iteration + 1) % 100 == 0:
+                avg_utility_0 = self.payoff_sum[0] / (self.iterations)
+                avg_utility_1 = self.payoff_sum[1] / (self.iterations)
                 print(
                     f"[MCCFR] Iteration {iteration + 1}/{num_iterations} "
                     f"- Nodes: {len(self.nodes)} - "
                     f"P0 util: {avg_utility_0:.4f}, P1 util: {avg_utility_1:.4f}"
                 )
+
+    def _merge_worker_result(
+        self,
+        worker_nodes: Dict[str, NodeInfo],
+        worker_iterations: int,
+        worker_payoff_sum: List[float],
+    ):
+        for info_state, worker_node in worker_nodes.items():
+            node = self.nodes.get(info_state)
+            if node is None:
+                self.nodes[info_state] = worker_node
+                continue
+
+            for action, regret in worker_node.regrets.items():
+                node.regrets[action] += regret
+            for action, strat_sum in worker_node.strategy_sums.items():
+                node.strategy_sums[action] += strat_sum
+            node.visits += worker_node.visits
+
+        self.iterations += worker_iterations
+        self.payoff_sum[0] += worker_payoff_sum[0]
+        self.payoff_sum[1] += worker_payoff_sum[1]
 
     def _mccfr_iteration(
         self, state, reach_probs: List[float], depth: int = 0
@@ -214,19 +295,57 @@ class MCCFRSolver:
             "iterations": self.iterations,
             "payoff_sum": self.payoff_sum,
         }
-        os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
-        with open(filepath, "wb") as f:
-            pickle.dump(data, f)
+        target_dir = os.path.dirname(filepath) or "."
+        os.makedirs(target_dir, exist_ok=True)
 
-    def load(self, filepath: str):
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                delete=False,
+                dir=target_dir,
+                prefix=".tmp_mccfr_",
+                suffix=".pkl",
+            ) as f:
+                tmp_path = f.name
+                pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, filepath)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+    def load(self, filepath: str) -> bool:
         """Load solver state."""
         if not os.path.exists(filepath):
-            return
-        with open(filepath, "rb") as f:
-            data = pickle.load(f)
-            self.nodes = data.get("nodes", {})
-            self.iterations = data.get("iterations", 0)
-            self.payoff_sum = data.get("payoff_sum", [0.0, 0.0])
+            return False
+        if os.path.getsize(filepath) == 0:
+            print(f"[MCCFR] Warning: Empty model file at {filepath}; starting fresh")
+            return False
+
+        try:
+            with open(filepath, "rb") as f:
+                data = pickle.load(f)
+        except (EOFError, pickle.UnpicklingError, AttributeError, ValueError) as e:
+            print(
+                f"[MCCFR] Warning: Failed to load model from {filepath}: {e}; starting fresh"
+            )
+            return False
+
+        if not isinstance(data, dict):
+            print(
+                f"[MCCFR] Warning: Unexpected model format in {filepath}; starting fresh"
+            )
+            return False
+
+        self.nodes = data.get("nodes", {})
+        self.iterations = data.get("iterations", 0)
+        self.payoff_sum = data.get("payoff_sum", [0.0, 0.0])
+        return True
 
 
 class FafnirMCCFRAI:
@@ -254,10 +373,14 @@ class FafnirMCCFRAI:
         # Try to load existing model
         if os.path.exists(self.model_path):
             print(f"[MCCFR AI] Loading existing model from {self.model_path}")
-            self.solver.load(self.model_path)
-            print(
-                f"[MCCFR AI] Model loaded: {self.solver.iterations} iterations, {len(self.solver.nodes)} states"
-            )
+            if self.solver.load(self.model_path):
+                print(
+                    f"[MCCFR AI] Model loaded: {self.solver.iterations} iterations, {len(self.solver.nodes)} states"
+                )
+            else:
+                print(
+                    "[MCCFR AI] Failed to load model; initialized empty solver"
+                )
         elif auto_train:
             # Auto train if requested and no model exists
             print("[MCCFR AI] No model found, starting initial training...")
@@ -274,9 +397,11 @@ class FafnirMCCFRAI:
         """Select best action for current state."""
         return self.solver.get_best_action(state)
 
-    def train(self, num_iterations: int = 100):
+    def train(self, num_iterations: int = 100, num_workers: int = 1):
         """Train the model further."""
-        self.solver.run_mccfr(num_iterations=num_iterations)
+        self.solver.run_mccfr(
+            num_iterations=num_iterations, num_workers=num_workers, show_progress=True
+        )
         self.save_model()
 
     def save_model(self):
@@ -286,8 +411,12 @@ class FafnirMCCFRAI:
 
     def load_model(self):
         """Load trained model."""
-        self.solver.load(self.model_path)
-        print(f"[MCCFR AI] Model loaded from {self.model_path}")
+        if self.solver.load(self.model_path):
+            print(f"[MCCFR AI] Model loaded from {self.model_path}")
+        else:
+            print(
+                f"[MCCFR AI] Failed to load model from {self.model_path}; using empty solver"
+            )
 
 
 # Simplified regret matching strategy
@@ -320,3 +449,30 @@ class SimpleRegretMatching:
         for i, action in enumerate(actions):
             regret = action_util[i] - np.mean(action_util)
             self.cumulative_regrets[info_state][action] += regret
+
+
+def _split_iterations(total: int, num_workers: int) -> List[int]:
+    if num_workers <= 1:
+        return [total]
+    base = total // num_workers
+    remainder = total % num_workers
+    counts = [base + (1 if i < remainder else 0) for i in range(num_workers)]
+    return [c for c in counts if c > 0]
+
+
+def _mccfr_worker(job) -> Tuple[Dict[str, NodeInfo], int, List[float]]:
+    game_class, num_iterations, learning_rate, exploration_bonus, max_depth, seed = job
+    if seed is not None:
+        np.random.seed(seed)
+        random.seed(seed)
+
+    solver = MCCFRSolver(
+        game_class,
+        learning_rate=learning_rate,
+        exploration_bonus=exploration_bonus,
+        max_depth=max_depth,
+    )
+    solver.run_mccfr(
+        num_iterations=num_iterations, num_workers=1, show_progress=False
+    )
+    return solver.nodes, solver.iterations, solver.payoff_sum

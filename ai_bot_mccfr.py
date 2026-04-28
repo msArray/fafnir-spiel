@@ -33,6 +33,7 @@ _last_emit_ts = 0.0
 _ok_sent_key: Optional[str] = None
 
 AUTO_NEXT = True
+ALLOW_EMPTY_BID = False
 
 
 def _loop_time() -> float:
@@ -84,6 +85,24 @@ def my_ok_ready(st: Dict[str, Any]) -> bool:
 def offer_set(st: Dict[str, Any]) -> set:
     offer = safe_list(st.get("offer"))
     return set([x for x in offer if isinstance(x, str)])
+
+
+def sanitize_bid(proposal: List[str], hand: List[str], forbidden: set) -> List[str]:
+    """
+    - Avoid colors listed in the offer.
+    - Must be a multiset of the current hand.
+    """
+    tmp = hand[:]
+    out: List[str] = []
+    for s in proposal:
+        if not isinstance(s, str):
+            continue
+        if s in forbidden:
+            continue
+        if s in tmp:
+            out.append(s)
+            tmp.remove(s)
+    return out
 
 
 def _phase_key(st: Dict[str, Any]) -> str:
@@ -161,24 +180,41 @@ async def suggest_bid_with_mccfr(st: Dict[str, Any]) -> List[str]:
     if state is None or ai_engine is None:
         # Fallback to heuristic
         hand = my_hand(st)
-        bids_by_others = safe_list(st.get("offer", []))
+        forbidden = offer_set(st)
 
         if not hand:
             return []
 
+        candidates = [x for x in hand if x not in forbidden]
+        if not candidates:
+            return []
+
         # Conservative bidding: bid 1-2 coins
-        n = random.randint(1, min(2, len(hand)))
-        return random.sample(hand, n)
+        n = random.randint(1, min(2, len(candidates)))
+        return random.sample(candidates, n)
 
     try:
         # Get best action from MCCFR AI
         best_action = ai_engine.select_action(state)
 
-        # Decode action
+        # Decode action and enforce server-side legality
         hand = my_hand(st)
+        forbidden = offer_set(st)
         if best_action is not None:
-            bid = decode_bid_action(hand, best_action)
-            print(f"[MCCFR AI] Selected action -> bid: {bid}")
+            if best_action >= (1 << len(hand)):
+                proposal: List[str] = []
+            else:
+                proposal = decode_bid_action(hand, best_action)
+
+            bid = sanitize_bid(proposal, hand, forbidden)
+            if (not ALLOW_EMPTY_BID) and (len(bid) == 0) and hand:
+                candidates = [x for x in hand if x not in forbidden]
+                if candidates:
+                    bid = [random.choice(candidates)]
+
+            print(
+                f"[MCCFR AI] Selected action -> proposal: {proposal} | bid: {bid}"
+            )
             return bid
     except Exception as e:
         print(f"[MCCFR AI] Error in MCCFR selection: {e}")
@@ -187,8 +223,14 @@ async def suggest_bid_with_mccfr(st: Dict[str, Any]) -> List[str]:
     hand = my_hand(st)
     if not hand:
         return []
-    n = random.randint(1, min(2, len(hand)))
-    return random.sample(hand, n)
+
+    forbidden = offer_set(st)
+    candidates = [x for x in hand if x not in forbidden]
+    if not candidates:
+        return []
+
+    n = random.randint(1, min(2, len(candidates)))
+    return random.sample(candidates, n)
 
 
 async def do_submit_bid(st: Dict[str, Any], reason: str):

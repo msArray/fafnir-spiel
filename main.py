@@ -27,6 +27,12 @@ def main():
         "--model-path", default="fafnir_mccfr_model.pkl", help="Model save path"
     )
     train_parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel workers for training (CPU)",
+    )
+    train_parser.add_argument(
         "--continue",
         dest="continue_train",
         action="store_true",
@@ -105,7 +111,7 @@ def main():
             f"[TRAIN] Current model state: {ai.solver.iterations} iterations completed"
         )
 
-        ai.train(args.iterations)
+        ai.train(args.iterations, num_workers=args.workers)
 
         print(f"[TRAIN] ✓ Training complete!")
         print(f"[TRAIN] Total iterations: {ai.solver.iterations}")
