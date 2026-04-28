@@ -45,6 +45,17 @@ def main():
         help="Nodes per shard when saving (0 to disable sharding)",
     )
     train_parser.add_argument(
+        "--save-quantize",
+        choices=["none", "float16"],
+        default="float16",
+        help="Quantize saved values (float16 or none)",
+    )
+    train_parser.add_argument(
+        "--load-quantized",
+        action="store_true",
+        help="Keep quantized values on load (lower memory, lower precision)",
+    )
+    train_parser.add_argument(
         "--continue",
         dest="continue_train",
         action="store_true",
@@ -65,6 +76,17 @@ def main():
     play_parser.add_argument("--name", default="MCCFR-AI", help="Player name")
     play_parser.add_argument(
         "--model-path", default="fafnir_mccfr_model.pkl", help="Model path"
+    )
+    play_parser.add_argument(
+        "--load-max-nodes",
+        type=int,
+        default=None,
+        help="Max number of nodes to load for play (None = load all)",
+    )
+    play_parser.add_argument(
+        "--load-quantized",
+        action="store_true",
+        help="Keep quantized values on load (lower memory, lower precision)",
     )
 
     args = parser.parse_args()
@@ -112,6 +134,7 @@ def main():
                 model_path=args.model_path,
                 auto_train=False,
                 max_nodes=args.max_nodes,
+                load_dequantize=not args.load_quantized,
             )
         else:
             if model_exists:
@@ -126,6 +149,7 @@ def main():
                 model_path=args.model_path,
                 auto_train=False,
                 max_nodes=args.max_nodes,
+                load_dequantize=not args.load_quantized,
             )
 
         print(f"[TRAIN] Training {args.iterations} iterations...")
@@ -143,10 +167,17 @@ def main():
         else:
             print("[TRAIN] Saving model as a single file")
 
+        save_quantize = None if args.save_quantize == "none" else args.save_quantize
+        if save_quantize:
+            print(f"[TRAIN] Quantizing saves as {save_quantize}")
+        else:
+            print("[TRAIN] Saving without quantization")
+
         ai.train(
             args.iterations,
             num_workers=args.workers,
             save_shard_size=save_shard_size,
+            save_quantize=save_quantize,
         )
 
         print(f"[TRAIN] ✓ Training complete!")
@@ -170,7 +201,12 @@ def main():
         try:
             asyncio.run(
                 ai_bot_mccfr.main_with_config(
-                    args.url, args.room, args.name, args.model_path
+                    args.url,
+                    args.room,
+                    args.name,
+                    args.model_path,
+                    args.load_max_nodes,
+                    args.load_quantized,
                 )
             )
         except KeyboardInterrupt:

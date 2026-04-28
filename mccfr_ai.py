@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 import pickle
 import os
 import tempfile
+import heapq
 
 
 @dataclass
@@ -340,18 +341,29 @@ class MCCFRSolver:
         best_action = actions[np.argmax(avg_strategy)]
         return best_action
 
-    def save(self, filepath: str, shard_size: Optional[int] = None):
+    def save(
+        self,
+        filepath: str,
+        shard_size: Optional[int] = None,
+        quantize_dtype: Optional[str] = None,
+    ):
         """Save solver state.
 
         If shard_size is provided and > 0, nodes are saved into multiple shard
         files to reduce peak memory usage during pickling.
         """
+        resolved_dtype = self._resolve_quantize_dtype(quantize_dtype)
         if shard_size is not None and shard_size > 0:
-            self._save_sharded(filepath, shard_size)
+            self._save_sharded(filepath, shard_size, quantize_dtype=resolved_dtype)
             return
 
+        nodes = (
+            self._quantize_nodes(self.nodes, resolved_dtype)
+            if resolved_dtype is not None
+            else self.nodes
+        )
         data = {
-            "nodes": self.nodes,
+            "nodes": nodes,
             "iterations": self.iterations,
             "payoff_sum": self.payoff_sum,
         }
@@ -379,14 +391,23 @@ class MCCFRSolver:
                 except OSError:
                     pass
 
-    def load(self, filepath: str) -> bool:
+    def load(
+        self,
+        filepath: str,
+        max_nodes: Optional[int] = None,
+        dequantize: bool = False,
+    ) -> bool:
         """Load solver state."""
         if os.path.isdir(filepath):
-            return self._load_sharded(filepath)
+            return self._load_sharded(
+                filepath, max_nodes=max_nodes, dequantize=dequantize
+            )
 
         shard_dir = f"{filepath}.shards"
         if not os.path.exists(filepath) and os.path.isdir(shard_dir):
-            return self._load_sharded(shard_dir)
+            return self._load_sharded(
+                shard_dir, max_nodes=max_nodes, dequantize=dequantize
+            )
 
         if not os.path.exists(filepath):
             return False
@@ -422,9 +443,76 @@ class MCCFRSolver:
             self.nodes = {}
         self.iterations = data.get("iterations", 0)
         self.payoff_sum = data.get("payoff_sum", [0.0, 0.0])
+        self._limit_loaded_nodes(max_nodes)
+        self._maybe_dequantize_nodes(dequantize)
         return True
 
-    def _save_sharded(self, filepath: str, shard_size: int):
+    def _resolve_quantize_dtype(self, quantize_dtype: Optional[str]):
+        if quantize_dtype is None:
+            return None
+        if isinstance(quantize_dtype, str):
+            normalized = quantize_dtype.strip().lower()
+            if normalized in {"none", "off", "false", "0"}:
+                return None
+            if normalized in {"float16", "fp16", "f16"}:
+                return np.float16
+        if quantize_dtype is np.float16:
+            return np.float16
+        raise ValueError(f"Unsupported quantize dtype: {quantize_dtype}")
+
+    def _quantize_nodes(
+        self,
+        nodes: Dict[bytes, NodeInfo],
+        dtype,
+    ) -> Dict[bytes, NodeInfo]:
+        if dtype is None:
+            return nodes
+        return {key: self._quantize_node(node, dtype) for key, node in nodes.items()}
+
+    def _quantize_node(self, node: "NodeInfo", dtype) -> "NodeInfo":
+        quantized = NodeInfo()
+        cast = dtype
+        for action, value in node.regrets.items():
+            quantized.regrets[action] = cast(value)
+        for action, value in node.strategy_sums.items():
+            quantized.strategy_sums[action] = cast(value)
+        quantized.visits = node.visits
+        return quantized
+
+    def _maybe_dequantize_nodes(self, dequantize: bool):
+        if not dequantize:
+            return
+        for node in self.nodes.values():
+            if not isinstance(node, NodeInfo):
+                continue
+            for action, value in list(node.regrets.items()):
+                node.regrets[action] = float(value)
+            for action, value in list(node.strategy_sums.items()):
+                node.strategy_sums[action] = float(value)
+
+    def _limit_loaded_nodes(self, max_nodes: Optional[int]):
+        if max_nodes is None or max_nodes <= 0:
+            return
+        if len(self.nodes) <= max_nodes:
+            return
+
+        heap = []
+        for key, node in self.nodes.items():
+            self._push_top_node(heap, max_nodes, key, node)
+        self.nodes = {key: node for _, key, node in heap}
+
+    def _push_top_node(self, heap, max_nodes: int, key: bytes, node: "NodeInfo"):
+        visits = getattr(node, "visits", 0)
+        entry = (visits, key, node)
+        if len(heap) < max_nodes:
+            heapq.heappush(heap, entry)
+            return
+        if visits > heap[0][0]:
+            heapq.heapreplace(heap, entry)
+
+    def _save_sharded(
+        self, filepath: str, shard_size: int, quantize_dtype=None
+    ):
         shard_dir = filepath if os.path.isdir(filepath) else f"{filepath}.shards"
         os.makedirs(shard_dir, exist_ok=True)
 
@@ -442,6 +530,7 @@ class MCCFRSolver:
             "payoff_sum": self.payoff_sum,
             "node_count": len(self.nodes),
             "shard_size": shard_size,
+            "quantized_dtype": "float16" if quantize_dtype is np.float16 else None,
         }
         self._atomic_pickle_dump(meta, os.path.join(shard_dir, "meta.pkl"))
 
@@ -451,15 +540,30 @@ class MCCFRSolver:
             chunk[info_state_key] = node
             if len(chunk) >= shard_size:
                 shard_path = os.path.join(shard_dir, f"nodes_{shard_index:05d}.pkl")
-                self._atomic_pickle_dump(chunk, shard_path)
+                payload = (
+                    self._quantize_nodes(chunk, quantize_dtype)
+                    if quantize_dtype is not None
+                    else chunk
+                )
+                self._atomic_pickle_dump(payload, shard_path)
                 shard_index += 1
                 chunk = {}
 
         if chunk:
             shard_path = os.path.join(shard_dir, f"nodes_{shard_index:05d}.pkl")
-            self._atomic_pickle_dump(chunk, shard_path)
+            payload = (
+                self._quantize_nodes(chunk, quantize_dtype)
+                if quantize_dtype is not None
+                else chunk
+            )
+            self._atomic_pickle_dump(payload, shard_path)
 
-    def _load_sharded(self, shard_dir: str) -> bool:
+    def _load_sharded(
+        self,
+        shard_dir: str,
+        max_nodes: Optional[int] = None,
+        dequantize: bool = False,
+    ) -> bool:
         meta_path = os.path.join(shard_dir, "meta.pkl")
         if not os.path.exists(meta_path):
             print(
@@ -476,30 +580,53 @@ class MCCFRSolver:
             )
             return False
 
-        self.nodes = {}
         shard_files = sorted(
             name
             for name in os.listdir(shard_dir)
             if name.startswith("nodes_") and name.endswith(".pkl")
         )
-        for name in shard_files:
-            shard_path = os.path.join(shard_dir, name)
-            try:
-                with open(shard_path, "rb") as f:
-                    shard_nodes = pickle.load(f)
-            except (EOFError, pickle.UnpicklingError, AttributeError, ValueError) as e:
-                print(
-                    f"[MCCFR] Warning: Failed to load shard {shard_path}: {e}; skipping"
-                )
-                continue
 
-            if isinstance(shard_nodes, dict):
-                for info_state, node in shard_nodes.items():
-                    key = self._coerce_info_state_key(info_state)
-                    self.nodes[key] = node
+        max_nodes = max_nodes if max_nodes and max_nodes > 0 else None
+        if max_nodes is None:
+            self.nodes = {}
+            for name in shard_files:
+                shard_path = os.path.join(shard_dir, name)
+                try:
+                    with open(shard_path, "rb") as f:
+                        shard_nodes = pickle.load(f)
+                except (EOFError, pickle.UnpicklingError, AttributeError, ValueError) as e:
+                    print(
+                        f"[MCCFR] Warning: Failed to load shard {shard_path}: {e}; skipping"
+                    )
+                    continue
+
+                if isinstance(shard_nodes, dict):
+                    for info_state, node in shard_nodes.items():
+                        key = self._coerce_info_state_key(info_state)
+                        self.nodes[key] = node
+        else:
+            heap = []
+            for name in shard_files:
+                shard_path = os.path.join(shard_dir, name)
+                try:
+                    with open(shard_path, "rb") as f:
+                        shard_nodes = pickle.load(f)
+                except (EOFError, pickle.UnpicklingError, AttributeError, ValueError) as e:
+                    print(
+                        f"[MCCFR] Warning: Failed to load shard {shard_path}: {e}; skipping"
+                    )
+                    continue
+
+                if isinstance(shard_nodes, dict):
+                    for info_state, node in shard_nodes.items():
+                        key = self._coerce_info_state_key(info_state)
+                        self._push_top_node(heap, max_nodes, key, node)
+
+            self.nodes = {key: node for _, key, node in heap}
 
         self.iterations = meta.get("iterations", 0)
         self.payoff_sum = meta.get("payoff_sum", [0.0, 0.0])
+        self._maybe_dequantize_nodes(dequantize)
         return True
 
     def _atomic_pickle_dump(self, data, filepath: str):
@@ -537,6 +664,8 @@ class FafnirMCCFRAI:
         auto_train: bool = False,
         max_depth: int = 512,
         max_nodes: Optional[int] = None,
+        load_max_nodes: Optional[int] = None,
+        load_dequantize: bool = False,
     ):
         """
         Initialize AI.
@@ -553,9 +682,18 @@ class FafnirMCCFRAI:
         self.model_path = model_path or "fafnir_mccfr_model.pkl"
 
         # Try to load existing model
-        if os.path.exists(self.model_path):
+        model_available = (
+            os.path.exists(self.model_path)
+            or os.path.isdir(self.model_path)
+            or os.path.isdir(f"{self.model_path}.shards")
+        )
+        if model_available:
             print(f"[MCCFR AI] Loading existing model from {self.model_path}")
-            if self.solver.load(self.model_path):
+            if self.solver.load(
+                self.model_path,
+                max_nodes=load_max_nodes,
+                dequantize=load_dequantize,
+            ):
                 print(
                     f"[MCCFR AI] Model loaded: {self.solver.iterations} iterations, {len(self.solver.nodes)} states"
                 )
@@ -584,16 +722,21 @@ class FafnirMCCFRAI:
         num_iterations: int = 100,
         num_workers: int = 1,
         save_shard_size: Optional[int] = None,
+        save_quantize: Optional[str] = None,
     ):
         """Train the model further."""
         self.solver.run_mccfr(
             num_iterations=num_iterations, num_workers=num_workers, show_progress=True
         )
-        self.save_model(shard_size=save_shard_size)
+        self.save_model(shard_size=save_shard_size, save_quantize=save_quantize)
 
-    def save_model(self, shard_size: Optional[int] = None):
+    def save_model(
+        self, shard_size: Optional[int] = None, save_quantize: Optional[str] = None
+    ):
         """Save trained model."""
-        self.solver.save(self.model_path, shard_size=shard_size)
+        self.solver.save(
+            self.model_path, shard_size=shard_size, quantize_dtype=save_quantize
+        )
         if shard_size is not None and shard_size > 0:
             shard_dir = (
                 self.model_path
@@ -604,9 +747,17 @@ class FafnirMCCFRAI:
         else:
             print(f"[MCCFR AI] Model saved to {self.model_path}")
 
-    def load_model(self):
+    def load_model(
+        self,
+        load_max_nodes: Optional[int] = None,
+        load_dequantize: bool = False,
+    ):
         """Load trained model."""
-        if self.solver.load(self.model_path):
+        if self.solver.load(
+            self.model_path,
+            max_nodes=load_max_nodes,
+            dequantize=load_dequantize,
+        ):
             print(f"[MCCFR AI] Model loaded from {self.model_path}")
         else:
             print(

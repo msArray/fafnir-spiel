@@ -348,6 +348,17 @@ async def main():
     ap.add_argument(
         "--train-iterations", type=int, default=500, help="Training iterations"
     )
+    ap.add_argument(
+        "--load-max-nodes",
+        type=int,
+        default=None,
+        help="Max number of nodes to load (None = load all)",
+    )
+    ap.add_argument(
+        "--load-quantized",
+        action="store_true",
+        help="Keep quantized values on load (lower memory, lower precision)",
+    )
     ap.add_argument("--auto-next", type=int, default=1, help="Auto OK/Next")
 
     args = ap.parse_args()
@@ -365,6 +376,8 @@ async def main():
         ai_engine = FafnirMCCFRAI(
             game_class,
             model_path=args.model_path,
+            load_max_nodes=args.load_max_nodes,
+            load_dequantize=not args.load_quantized,
         )
         if args.train_iterations > 0:
             print(f"[MCCFR-AI] Additional training: {args.train_iterations} iterations")
@@ -406,7 +419,14 @@ if __name__ == "__main__":
     asyncio.run(main())
 
 
-async def main_with_config(url: str, room: str, name: str, model_path: str = None):
+async def main_with_config(
+    url: str,
+    room: str,
+    name: str,
+    model_path: str = None,
+    load_max_nodes: int = None,
+    load_quantized: bool = False,
+):
     """
     Entry point called from main.py with configuration.
     """
@@ -429,6 +449,8 @@ async def main_with_config(url: str, room: str, name: str, model_path: str = Non
             game_class,
             model_path=model_file,
             auto_train=False,  # Don't auto-train when loading for play
+            load_max_nodes=load_max_nodes,
+            load_dequantize=not load_quantized,
         )
         print(
             f"[MCCFR-AI] AI engine ready: {ai_engine.solver.iterations} iterations trained"
