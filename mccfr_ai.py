@@ -73,6 +73,7 @@ class MCCFRSolver:
         learning_rate: float = 0.1,
         exploration_bonus: float = 0.1,
         max_depth: int = 512,
+        max_nodes: Optional[int] = None,
     ):
         """
         Initialize MCCFR solver.
@@ -90,12 +91,26 @@ class MCCFRSolver:
         self.nodes: Dict[str, NodeInfo] = {}
         self.iterations = 0
         self.payoff_sum = [0.0, 0.0]
+        self.max_nodes = max_nodes if max_nodes and max_nodes > 0 else None
+        self._max_nodes_warning_emitted = False
 
-    def get_node(self, info_state: str) -> NodeInfo:
+    def get_node(self, info_state: str) -> Optional[NodeInfo]:
         """Get or create node."""
-        if info_state not in self.nodes:
-            self.nodes[info_state] = NodeInfo(info_state=info_state)
-        return self.nodes[info_state]
+        node = self.nodes.get(info_state)
+        if node is not None:
+            return node
+
+        if self.max_nodes is not None and len(self.nodes) >= self.max_nodes:
+            if not self._max_nodes_warning_emitted:
+                print(
+                    f"[MCCFR] Warning: max_nodes {self.max_nodes} reached; skipping new nodes"
+                )
+                self._max_nodes_warning_emitted = True
+            return None
+
+        node = NodeInfo(info_state=info_state)
+        self.nodes[info_state] = node
+        return node
 
     def run_mccfr(
         self,
@@ -130,6 +145,7 @@ class MCCFRSolver:
                 self.learning_rate,
                 self.exploration_bonus,
                 self.max_depth,
+                self.max_nodes,
                 seeds[i],
             )
             for i, count in enumerate(counts)
@@ -181,6 +197,13 @@ class MCCFRSolver:
         for info_state, worker_node in worker_nodes.items():
             node = self.nodes.get(info_state)
             if node is None:
+                if self.max_nodes is not None and len(self.nodes) >= self.max_nodes:
+                    if not self._max_nodes_warning_emitted:
+                        print(
+                            f"[MCCFR] Warning: max_nodes {self.max_nodes} reached; skipping new nodes"
+                        )
+                        self._max_nodes_warning_emitted = True
+                    continue
                 self.nodes[info_state] = worker_node
                 continue
 
@@ -218,6 +241,18 @@ class MCCFRSolver:
         # Get or create node
         info_state_str = self._get_info_state(state, current_player)
         node = self.get_node(info_state_str)
+        if node is None:
+            # Skip updates when max_nodes reached; fall back to uniform random action
+            action = random.choice(actions)
+            if hasattr(state, "clone") and callable(getattr(state, "clone")):
+                next_state = state.clone()
+            else:
+                next_state = copy.deepcopy(state)
+            next_state.apply_action(action)
+            reach_probs_next = reach_probs[:]
+            reach_probs_next[current_player] *= 1.0 / len(actions)
+            return self._mccfr_iteration(next_state, reach_probs_next, depth + 1)
+
         node.visits += 1
 
         # Compute strategy
@@ -357,6 +392,7 @@ class FafnirMCCFRAI:
         model_path: str = None,
         auto_train: bool = False,
         max_depth: int = 512,
+        max_nodes: Optional[int] = None,
     ):
         """
         Initialize AI.
@@ -367,7 +403,9 @@ class FafnirMCCFRAI:
             auto_train: If True, automatically train on init if no model exists
         """
         self.game_class = game_class
-        self.solver = MCCFRSolver(game_class, max_depth=max_depth)
+        self.solver = MCCFRSolver(
+            game_class, max_depth=max_depth, max_nodes=max_nodes
+        )
         self.model_path = model_path or "fafnir_mccfr_model.pkl"
 
         # Try to load existing model
@@ -461,7 +499,15 @@ def _split_iterations(total: int, num_workers: int) -> List[int]:
 
 
 def _mccfr_worker(job) -> Tuple[Dict[str, NodeInfo], int, List[float]]:
-    game_class, num_iterations, learning_rate, exploration_bonus, max_depth, seed = job
+    (
+        game_class,
+        num_iterations,
+        learning_rate,
+        exploration_bonus,
+        max_depth,
+        max_nodes,
+        seed,
+    ) = job
     if seed is not None:
         np.random.seed(seed)
         random.seed(seed)
@@ -471,6 +517,7 @@ def _mccfr_worker(job) -> Tuple[Dict[str, NodeInfo], int, List[float]]:
         learning_rate=learning_rate,
         exploration_bonus=exploration_bonus,
         max_depth=max_depth,
+        max_nodes=max_nodes,
     )
     solver.run_mccfr(
         num_iterations=num_iterations, num_workers=1, show_progress=False

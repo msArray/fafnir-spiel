@@ -33,6 +33,12 @@ def main():
         help="Number of parallel workers for training (CPU)",
     )
     train_parser.add_argument(
+        "--max-nodes",
+        type=int,
+        default=None,
+        help="Max number of MCCFR nodes to keep (None = unlimited)",
+    )
+    train_parser.add_argument(
         "--continue",
         dest="continue_train",
         action="store_true",
@@ -95,7 +101,12 @@ def main():
             except:
                 pass
             # Create fresh AI without loading existing model
-            ai = FafnirMCCFRAI(FafnirGame, model_path=args.model_path, auto_train=False)
+            ai = FafnirMCCFRAI(
+                FafnirGame,
+                model_path=args.model_path,
+                auto_train=False,
+                max_nodes=args.max_nodes,
+            )
         else:
             if model_exists:
                 print(f"[TRAIN] Continuing from existing model: {args.model_path}")
@@ -104,7 +115,12 @@ def main():
                     f"[TRAIN] No existing model found, starting fresh training: {args.model_path}"
                 )
             # Load existing model or create new one
-            ai = FafnirMCCFRAI(FafnirGame, model_path=args.model_path, auto_train=False)
+            ai = FafnirMCCFRAI(
+                FafnirGame,
+                model_path=args.model_path,
+                auto_train=False,
+                max_nodes=args.max_nodes,
+            )
 
         print(f"[TRAIN] Training {args.iterations} iterations...")
         print(
