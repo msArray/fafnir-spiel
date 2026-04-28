@@ -39,6 +39,12 @@ def main():
         help="Max number of MCCFR nodes to keep (None = unlimited)",
     )
     train_parser.add_argument(
+        "--save-shard-size",
+        type=int,
+        default=100000,
+        help="Nodes per shard when saving (0 to disable sharding)",
+    )
+    train_parser.add_argument(
         "--continue",
         dest="continue_train",
         action="store_true",
@@ -127,7 +133,21 @@ def main():
             f"[TRAIN] Current model state: {ai.solver.iterations} iterations completed"
         )
 
-        ai.train(args.iterations, num_workers=args.workers)
+        save_shard_size = (
+            args.save_shard_size
+            if args.save_shard_size is not None and args.save_shard_size > 0
+            else None
+        )
+        if save_shard_size:
+            print(f"[TRAIN] Saving model in shards of {save_shard_size} nodes")
+        else:
+            print("[TRAIN] Saving model as a single file")
+
+        ai.train(
+            args.iterations,
+            num_workers=args.workers,
+            save_shard_size=save_shard_size,
+        )
 
         print(f"[TRAIN] ✓ Training complete!")
         print(f"[TRAIN] Total iterations: {ai.solver.iterations}")

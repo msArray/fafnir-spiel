@@ -340,8 +340,16 @@ class MCCFRSolver:
         best_action = actions[np.argmax(avg_strategy)]
         return best_action
 
-    def save(self, filepath: str):
-        """Save solver state."""
+    def save(self, filepath: str, shard_size: Optional[int] = None):
+        """Save solver state.
+
+        If shard_size is provided and > 0, nodes are saved into multiple shard
+        files to reduce peak memory usage during pickling.
+        """
+        if shard_size is not None and shard_size > 0:
+            self._save_sharded(filepath, shard_size)
+            return
+
         data = {
             "nodes": self.nodes,
             "iterations": self.iterations,
@@ -373,6 +381,13 @@ class MCCFRSolver:
 
     def load(self, filepath: str) -> bool:
         """Load solver state."""
+        if os.path.isdir(filepath):
+            return self._load_sharded(filepath)
+
+        shard_dir = f"{filepath}.shards"
+        if not os.path.exists(filepath) and os.path.isdir(shard_dir):
+            return self._load_sharded(shard_dir)
+
         if not os.path.exists(filepath):
             return False
         if os.path.getsize(filepath) == 0:
@@ -408,6 +423,108 @@ class MCCFRSolver:
         self.iterations = data.get("iterations", 0)
         self.payoff_sum = data.get("payoff_sum", [0.0, 0.0])
         return True
+
+    def _save_sharded(self, filepath: str, shard_size: int):
+        shard_dir = filepath if os.path.isdir(filepath) else f"{filepath}.shards"
+        os.makedirs(shard_dir, exist_ok=True)
+
+        # Remove old shard files to avoid stale leftovers on smaller saves.
+        for filename in os.listdir(shard_dir):
+            if filename.startswith("nodes_") and filename.endswith(".pkl"):
+                try:
+                    os.remove(os.path.join(shard_dir, filename))
+                except OSError:
+                    pass
+
+        meta = {
+            "format_version": 1,
+            "iterations": self.iterations,
+            "payoff_sum": self.payoff_sum,
+            "node_count": len(self.nodes),
+            "shard_size": shard_size,
+        }
+        self._atomic_pickle_dump(meta, os.path.join(shard_dir, "meta.pkl"))
+
+        shard_index = 0
+        chunk: Dict[bytes, NodeInfo] = {}
+        for info_state_key, node in self.nodes.items():
+            chunk[info_state_key] = node
+            if len(chunk) >= shard_size:
+                shard_path = os.path.join(shard_dir, f"nodes_{shard_index:05d}.pkl")
+                self._atomic_pickle_dump(chunk, shard_path)
+                shard_index += 1
+                chunk = {}
+
+        if chunk:
+            shard_path = os.path.join(shard_dir, f"nodes_{shard_index:05d}.pkl")
+            self._atomic_pickle_dump(chunk, shard_path)
+
+    def _load_sharded(self, shard_dir: str) -> bool:
+        meta_path = os.path.join(shard_dir, "meta.pkl")
+        if not os.path.exists(meta_path):
+            print(
+                f"[MCCFR] Warning: Missing shard metadata at {meta_path}; starting fresh"
+            )
+            return False
+
+        try:
+            with open(meta_path, "rb") as f:
+                meta = pickle.load(f)
+        except (EOFError, pickle.UnpicklingError, AttributeError, ValueError) as e:
+            print(
+                f"[MCCFR] Warning: Failed to load shard metadata from {meta_path}: {e}; starting fresh"
+            )
+            return False
+
+        self.nodes = {}
+        shard_files = sorted(
+            name
+            for name in os.listdir(shard_dir)
+            if name.startswith("nodes_") and name.endswith(".pkl")
+        )
+        for name in shard_files:
+            shard_path = os.path.join(shard_dir, name)
+            try:
+                with open(shard_path, "rb") as f:
+                    shard_nodes = pickle.load(f)
+            except (EOFError, pickle.UnpicklingError, AttributeError, ValueError) as e:
+                print(
+                    f"[MCCFR] Warning: Failed to load shard {shard_path}: {e}; skipping"
+                )
+                continue
+
+            if isinstance(shard_nodes, dict):
+                for info_state, node in shard_nodes.items():
+                    key = self._coerce_info_state_key(info_state)
+                    self.nodes[key] = node
+
+        self.iterations = meta.get("iterations", 0)
+        self.payoff_sum = meta.get("payoff_sum", [0.0, 0.0])
+        return True
+
+    def _atomic_pickle_dump(self, data, filepath: str):
+        target_dir = os.path.dirname(filepath) or "."
+        os.makedirs(target_dir, exist_ok=True)
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                delete=False,
+                dir=target_dir,
+                prefix=".tmp_mccfr_",
+                suffix=".pkl",
+            ) as f:
+                tmp_path = f.name
+                pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, filepath)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
 
 class FafnirMCCFRAI:
@@ -462,17 +579,30 @@ class FafnirMCCFRAI:
         """Select best action for current state."""
         return self.solver.get_best_action(state)
 
-    def train(self, num_iterations: int = 100, num_workers: int = 1):
+    def train(
+        self,
+        num_iterations: int = 100,
+        num_workers: int = 1,
+        save_shard_size: Optional[int] = None,
+    ):
         """Train the model further."""
         self.solver.run_mccfr(
             num_iterations=num_iterations, num_workers=num_workers, show_progress=True
         )
-        self.save_model()
+        self.save_model(shard_size=save_shard_size)
 
-    def save_model(self):
+    def save_model(self, shard_size: Optional[int] = None):
         """Save trained model."""
-        self.solver.save(self.model_path)
-        print(f"[MCCFR AI] Model saved to {self.model_path}")
+        self.solver.save(self.model_path, shard_size=shard_size)
+        if shard_size is not None and shard_size > 0:
+            shard_dir = (
+                self.model_path
+                if os.path.isdir(self.model_path)
+                else f"{self.model_path}.shards"
+            )
+            print(f"[MCCFR AI] Model shards saved to {shard_dir}")
+        else:
+            print(f"[MCCFR AI] Model saved to {self.model_path}")
 
     def load_model(self):
         """Load trained model."""
