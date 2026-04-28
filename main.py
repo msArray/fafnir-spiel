@@ -51,6 +51,11 @@ def main():
         help="Quantize saved values (float16 or none)",
     )
     train_parser.add_argument(
+        "--save-compress",
+        action="store_true",
+        help="Compress saved model data with gzip",
+    )
+    train_parser.add_argument(
         "--load-quantized",
         action="store_true",
         help="Keep quantized values on load (lower memory, lower precision)",
@@ -173,11 +178,15 @@ def main():
         else:
             print("[TRAIN] Saving without quantization")
 
+        if args.save_compress:
+            print("[TRAIN] Compressing saved model data")
+
         ai.train(
             args.iterations,
             num_workers=args.workers,
             save_shard_size=save_shard_size,
             save_quantize=save_quantize,
+            save_compress=args.save_compress,
         )
 
         print(f"[TRAIN] ✓ Training complete!")

@@ -16,6 +16,10 @@ import pickle
 import os
 import tempfile
 import heapq
+import gzip
+
+
+GZIP_MAGIC = b"\x1f\x8b"
 
 
 @dataclass
@@ -346,6 +350,7 @@ class MCCFRSolver:
         filepath: str,
         shard_size: Optional[int] = None,
         quantize_dtype: Optional[str] = None,
+        compress: bool = False,
     ):
         """Save solver state.
 
@@ -354,7 +359,12 @@ class MCCFRSolver:
         """
         resolved_dtype = self._resolve_quantize_dtype(quantize_dtype)
         if shard_size is not None and shard_size > 0:
-            self._save_sharded(filepath, shard_size, quantize_dtype=resolved_dtype)
+            self._save_sharded(
+                filepath,
+                shard_size,
+                quantize_dtype=resolved_dtype,
+                compress=compress,
+            )
             return
 
         nodes = (
@@ -380,8 +390,13 @@ class MCCFRSolver:
                 suffix=".pkl",
             ) as f:
                 tmp_path = f.name
-                pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-                f.flush()
+                if compress:
+                    with gzip.GzipFile(fileobj=f, mode="wb") as gz:
+                        pickle.dump(data, gz, protocol=pickle.HIGHEST_PROTOCOL)
+                        gz.flush()
+                else:
+                    pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, filepath)
         finally:
@@ -416,8 +431,7 @@ class MCCFRSolver:
             return False
 
         try:
-            with open(filepath, "rb") as f:
-                data = pickle.load(f)
+            data = self._load_pickle_file(filepath)
         except (EOFError, pickle.UnpicklingError, AttributeError, ValueError) as e:
             print(
                 f"[MCCFR] Warning: Failed to load model from {filepath}: {e}; starting fresh"
@@ -511,7 +525,11 @@ class MCCFRSolver:
             heapq.heapreplace(heap, entry)
 
     def _save_sharded(
-        self, filepath: str, shard_size: int, quantize_dtype=None
+        self,
+        filepath: str,
+        shard_size: int,
+        quantize_dtype=None,
+        compress: bool = False,
     ):
         shard_dir = filepath if os.path.isdir(filepath) else f"{filepath}.shards"
         os.makedirs(shard_dir, exist_ok=True)
@@ -531,8 +549,11 @@ class MCCFRSolver:
             "node_count": len(self.nodes),
             "shard_size": shard_size,
             "quantized_dtype": "float16" if quantize_dtype is np.float16 else None,
+            "compressed": bool(compress),
         }
-        self._atomic_pickle_dump(meta, os.path.join(shard_dir, "meta.pkl"))
+        self._atomic_pickle_dump(
+            meta, os.path.join(shard_dir, "meta.pkl"), compress=compress
+        )
 
         shard_index = 0
         chunk: Dict[bytes, NodeInfo] = {}
@@ -545,7 +566,7 @@ class MCCFRSolver:
                     if quantize_dtype is not None
                     else chunk
                 )
-                self._atomic_pickle_dump(payload, shard_path)
+                self._atomic_pickle_dump(payload, shard_path, compress=compress)
                 shard_index += 1
                 chunk = {}
 
@@ -556,7 +577,7 @@ class MCCFRSolver:
                 if quantize_dtype is not None
                 else chunk
             )
-            self._atomic_pickle_dump(payload, shard_path)
+            self._atomic_pickle_dump(payload, shard_path, compress=compress)
 
     def _load_sharded(
         self,
@@ -572,8 +593,7 @@ class MCCFRSolver:
             return False
 
         try:
-            with open(meta_path, "rb") as f:
-                meta = pickle.load(f)
+            meta = self._load_pickle_file(meta_path)
         except (EOFError, pickle.UnpicklingError, AttributeError, ValueError) as e:
             print(
                 f"[MCCFR] Warning: Failed to load shard metadata from {meta_path}: {e}; starting fresh"
@@ -592,8 +612,7 @@ class MCCFRSolver:
             for name in shard_files:
                 shard_path = os.path.join(shard_dir, name)
                 try:
-                    with open(shard_path, "rb") as f:
-                        shard_nodes = pickle.load(f)
+                    shard_nodes = self._load_pickle_file(shard_path)
                 except (EOFError, pickle.UnpicklingError, AttributeError, ValueError) as e:
                     print(
                         f"[MCCFR] Warning: Failed to load shard {shard_path}: {e}; skipping"
@@ -609,8 +628,7 @@ class MCCFRSolver:
             for name in shard_files:
                 shard_path = os.path.join(shard_dir, name)
                 try:
-                    with open(shard_path, "rb") as f:
-                        shard_nodes = pickle.load(f)
+                    shard_nodes = self._load_pickle_file(shard_path)
                 except (EOFError, pickle.UnpicklingError, AttributeError, ValueError) as e:
                     print(
                         f"[MCCFR] Warning: Failed to load shard {shard_path}: {e}; skipping"
@@ -629,7 +647,7 @@ class MCCFRSolver:
         self._maybe_dequantize_nodes(dequantize)
         return True
 
-    def _atomic_pickle_dump(self, data, filepath: str):
+    def _atomic_pickle_dump(self, data, filepath: str, compress: bool = False):
         target_dir = os.path.dirname(filepath) or "."
         os.makedirs(target_dir, exist_ok=True)
         tmp_path = None
@@ -642,8 +660,13 @@ class MCCFRSolver:
                 suffix=".pkl",
             ) as f:
                 tmp_path = f.name
-                pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-                f.flush()
+                if compress:
+                    with gzip.GzipFile(fileobj=f, mode="wb") as gz:
+                        pickle.dump(data, gz, protocol=pickle.HIGHEST_PROTOCOL)
+                        gz.flush()
+                else:
+                    pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, filepath)
         finally:
@@ -652,6 +675,15 @@ class MCCFRSolver:
                     os.remove(tmp_path)
                 except OSError:
                     pass
+
+    def _load_pickle_file(self, filepath: str):
+        with open(filepath, "rb") as f:
+            magic = f.read(2)
+        if magic == GZIP_MAGIC:
+            with gzip.open(filepath, "rb") as f:
+                return pickle.load(f)
+        with open(filepath, "rb") as f:
+            return pickle.load(f)
 
 
 class FafnirMCCFRAI:
@@ -723,19 +755,30 @@ class FafnirMCCFRAI:
         num_workers: int = 1,
         save_shard_size: Optional[int] = None,
         save_quantize: Optional[str] = None,
+        save_compress: bool = False,
     ):
         """Train the model further."""
         self.solver.run_mccfr(
             num_iterations=num_iterations, num_workers=num_workers, show_progress=True
         )
-        self.save_model(shard_size=save_shard_size, save_quantize=save_quantize)
+        self.save_model(
+            shard_size=save_shard_size,
+            save_quantize=save_quantize,
+            save_compress=save_compress,
+        )
 
     def save_model(
-        self, shard_size: Optional[int] = None, save_quantize: Optional[str] = None
+        self,
+        shard_size: Optional[int] = None,
+        save_quantize: Optional[str] = None,
+        save_compress: bool = False,
     ):
         """Save trained model."""
         self.solver.save(
-            self.model_path, shard_size=shard_size, quantize_dtype=save_quantize
+            self.model_path,
+            shard_size=shard_size,
+            quantize_dtype=save_quantize,
+            compress=save_compress,
         )
         if shard_size is not None and shard_size > 0:
             shard_dir = (
