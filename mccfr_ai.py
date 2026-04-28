@@ -21,7 +21,6 @@ import tempfile
 class NodeInfo:
     """Information about a game tree node."""
 
-    info_state: str
     regrets: DefaultDict[int, float] = field(default_factory=lambda: defaultdict(float))
     strategy_sums: DefaultDict[int, float] = field(
         default_factory=lambda: defaultdict(float)
@@ -88,15 +87,15 @@ class MCCFRSolver:
         self.learning_rate = learning_rate
         self.exploration_bonus = exploration_bonus
         self.max_depth = max_depth
-        self.nodes: Dict[str, NodeInfo] = {}
+        self.nodes: Dict[bytes, NodeInfo] = {}
         self.iterations = 0
         self.payoff_sum = [0.0, 0.0]
         self.max_nodes = max_nodes if max_nodes and max_nodes > 0 else None
         self._max_nodes_warning_emitted = False
 
-    def get_node(self, info_state: str) -> Optional[NodeInfo]:
+    def get_node(self, info_state_key: bytes) -> Optional[NodeInfo]:
         """Get or create node."""
-        node = self.nodes.get(info_state)
+        node = self.nodes.get(info_state_key)
         if node is not None:
             return node
 
@@ -108,8 +107,8 @@ class MCCFRSolver:
                 self._max_nodes_warning_emitted = True
             return None
 
-        node = NodeInfo(info_state=info_state)
-        self.nodes[info_state] = node
+        node = NodeInfo()
+        self.nodes[info_state_key] = node
         return node
 
     def run_mccfr(
@@ -190,12 +189,12 @@ class MCCFRSolver:
 
     def _merge_worker_result(
         self,
-        worker_nodes: Dict[str, NodeInfo],
+        worker_nodes: Dict[bytes, NodeInfo],
         worker_iterations: int,
         worker_payoff_sum: List[float],
     ):
-        for info_state, worker_node in worker_nodes.items():
-            node = self.nodes.get(info_state)
+        for info_state_key, worker_node in worker_nodes.items():
+            node = self.nodes.get(info_state_key)
             if node is None:
                 if self.max_nodes is not None and len(self.nodes) >= self.max_nodes:
                     if not self._max_nodes_warning_emitted:
@@ -204,7 +203,7 @@ class MCCFRSolver:
                         )
                         self._max_nodes_warning_emitted = True
                     continue
-                self.nodes[info_state] = worker_node
+                self.nodes[info_state_key] = worker_node
                 continue
 
             for action, regret in worker_node.regrets.items():
@@ -239,8 +238,8 @@ class MCCFRSolver:
             return [0.0, 0.0]
 
         # Get or create node
-        info_state_str = self._get_info_state(state, current_player)
-        node = self.get_node(info_state_str)
+        info_state_key = self._get_info_state_key(state, current_player)
+        node = self.get_node(info_state_key)
         if node is None:
             # Skip updates when max_nodes reached; fall back to uniform random action
             action = random.choice(actions)
@@ -295,10 +294,28 @@ class MCCFRSolver:
 
         return utilities
 
-    def _get_info_state(self, state, player: int) -> str:
-        """Get legible information state string."""
-        obs = state.observation_tensor(player)
-        return f"P{player}:" + ",".join(str(int(o)) for o in obs[:20])  # Simplified
+    def _get_info_state_key(self, state, player: int) -> bytes:
+        """Get a compact, hashable information-state key."""
+        obs = np.asarray(state.observation_tensor(player), dtype=np.int32)
+        # Prefix the active player so both perspectives remain distinct.
+        return bytes([player]) + obs.tobytes()
+
+    def _coerce_info_state_key(self, info_state) -> bytes:
+        """Normalize legacy and current model keys to the compact byte format."""
+        if isinstance(info_state, bytes):
+            return info_state
+        if isinstance(info_state, str):
+            try:
+                player_part, observation_part = info_state.split(":", 1)
+                player = int(player_part[1:])
+                observation_values = [
+                    int(value) for value in observation_part.split(",") if value
+                ]
+                observation_array = np.asarray(observation_values, dtype=np.int32)
+                return bytes([player]) + observation_array.tobytes()
+            except (ValueError, IndexError):
+                return info_state.encode("utf-8", errors="surrogatepass")
+        return str(info_state).encode("utf-8", errors="surrogatepass")
 
     def get_best_action(self, state) -> int:
         """Get best action from current state using learned strategy."""
@@ -311,8 +328,8 @@ class MCCFRSolver:
         if not actions:
             return None
 
-        info_state_str = self._get_info_state(state, current_player)
-        node = self.get_node(info_state_str) if info_state_str in self.nodes else None
+        info_state_key = self._get_info_state_key(state, current_player)
+        node = self.get_node(info_state_key) if info_state_key in self.nodes else None
 
         if node is None:
             # Random action if node not in tree
@@ -377,7 +394,17 @@ class MCCFRSolver:
             )
             return False
 
-        self.nodes = data.get("nodes", {})
+        loaded_nodes = data.get("nodes", {})
+        if isinstance(loaded_nodes, dict):
+            if all(isinstance(key, bytes) for key in loaded_nodes.keys()):
+                self.nodes = loaded_nodes
+            else:
+                self.nodes = {
+                    self._coerce_info_state_key(info_state): node
+                    for info_state, node in loaded_nodes.items()
+                }
+        else:
+            self.nodes = {}
         self.iterations = data.get("iterations", 0)
         self.payoff_sum = data.get("payoff_sum", [0.0, 0.0])
         return True
