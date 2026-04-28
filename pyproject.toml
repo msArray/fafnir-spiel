@@ -1,0 +1,22 @@
+[project]
+name = "fafnir-spiel"
+version = "0.1.0"
+description = "Fafnir MCCFR AI using OpenSpiel - Monte Carlo Counterfactual Regret Minimization for board game AI"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "open-spiel>=1.6.11",
+    "numpy>=1.21.0",
+    "fastapi>=0.100.0",
+    "python-socketio[asyncio_client]>=5.9.0",
+    "uvicorn>=0.23.0",
+    "aiohttp>=3.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+fafnir = "main:main"
