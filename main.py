@@ -39,6 +39,29 @@ def main():
         help="Max number of MCCFR nodes to keep (None = unlimited)",
     )
     train_parser.add_argument(
+        "--prune-on-max-nodes",
+        action="store_true",
+        help="Prune low-visit nodes when max-nodes is reached",
+    )
+    train_parser.add_argument(
+        "--prune-keep-ratio",
+        type=float,
+        default=0.9,
+        help="Fraction of most-visited nodes to keep when pruning (0-1)",
+    )
+    train_parser.add_argument(
+        "--memory-quantize",
+        choices=["none", "float16"],
+        default="none",
+        help="Quantize in-memory values during training",
+    )
+    train_parser.add_argument(
+        "--memory-quantize-interval",
+        type=int,
+        default=200,
+        help="Iterations between in-memory quantization (0 to disable)",
+    )
+    train_parser.add_argument(
         "--save-shard-size",
         type=int,
         default=100000,
@@ -119,6 +142,9 @@ def main():
         from mccfr_ai import FafnirMCCFRAI
 
         model_exists = os.path.exists(args.model_path)
+        memory_quantize = (
+            None if args.memory_quantize == "none" else args.memory_quantize
+        )
 
         # Determine training mode
         if args.reset:
@@ -139,6 +165,10 @@ def main():
                 model_path=args.model_path,
                 auto_train=False,
                 max_nodes=args.max_nodes,
+                prune_on_max_nodes=args.prune_on_max_nodes,
+                prune_keep_ratio=args.prune_keep_ratio,
+                memory_quantize=memory_quantize,
+                memory_quantize_interval=args.memory_quantize_interval,
                 load_dequantize=not args.load_quantized,
             )
         else:
@@ -154,6 +184,10 @@ def main():
                 model_path=args.model_path,
                 auto_train=False,
                 max_nodes=args.max_nodes,
+                prune_on_max_nodes=args.prune_on_max_nodes,
+                prune_keep_ratio=args.prune_keep_ratio,
+                memory_quantize=memory_quantize,
+                memory_quantize_interval=args.memory_quantize_interval,
                 load_dequantize=not args.load_quantized,
             )
 

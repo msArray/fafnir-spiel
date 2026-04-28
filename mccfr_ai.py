@@ -78,6 +78,10 @@ class MCCFRSolver:
         exploration_bonus: float = 0.1,
         max_depth: int = 512,
         max_nodes: Optional[int] = None,
+        prune_on_max_nodes: bool = False,
+        prune_keep_ratio: float = 0.9,
+        memory_quantize: Optional[str] = None,
+        memory_quantize_interval: int = 200,
     ):
         """
         Initialize MCCFR solver.
@@ -97,6 +101,15 @@ class MCCFRSolver:
         self.payoff_sum = [0.0, 0.0]
         self.max_nodes = max_nodes if max_nodes and max_nodes > 0 else None
         self._max_nodes_warning_emitted = False
+        self.prune_on_max_nodes = bool(prune_on_max_nodes)
+        self.prune_keep_ratio = float(prune_keep_ratio)
+        self.memory_quantize_dtype = self._resolve_quantize_dtype(memory_quantize)
+        self.memory_quantize_interval = (
+            int(memory_quantize_interval)
+            if memory_quantize_interval and memory_quantize_interval > 0
+            else 0
+        )
+        self._last_memory_quantize_iteration = 0
 
     def get_node(self, info_state_key: bytes) -> Optional[NodeInfo]:
         """Get or create node."""
@@ -104,12 +117,7 @@ class MCCFRSolver:
         if node is not None:
             return node
 
-        if self.max_nodes is not None and len(self.nodes) >= self.max_nodes:
-            if not self._max_nodes_warning_emitted:
-                print(
-                    f"[MCCFR] Warning: max_nodes {self.max_nodes} reached; skipping new nodes"
-                )
-                self._max_nodes_warning_emitted = True
+        if not self._ensure_capacity_for_new_node():
             return None
 
         node = NodeInfo()
@@ -150,6 +158,10 @@ class MCCFRSolver:
                 self.exploration_bonus,
                 self.max_depth,
                 self.max_nodes,
+                self.prune_on_max_nodes,
+                self.prune_keep_ratio,
+                self.memory_quantize_dtype,
+                self.memory_quantize_interval,
                 seeds[i],
             )
             for i, count in enumerate(counts)
@@ -161,6 +173,8 @@ class MCCFRSolver:
 
         for nodes, iterations, payoff_sum in results:
             self._merge_worker_result(nodes, iterations, payoff_sum)
+
+        self._maybe_quantize_memory(self.iterations)
 
         if show_progress:
             avg_utility_0 = (
@@ -183,6 +197,8 @@ class MCCFRSolver:
             self.payoff_sum[1] += utilities[1]
             self.iterations += 1
 
+            self._maybe_quantize_memory(self.iterations)
+
             if show_progress and (iteration + 1) % 100 == 0:
                 avg_utility_0 = self.payoff_sum[0] / (self.iterations)
                 avg_utility_1 = self.payoff_sum[1] / (self.iterations)
@@ -201,12 +217,7 @@ class MCCFRSolver:
         for info_state_key, worker_node in worker_nodes.items():
             node = self.nodes.get(info_state_key)
             if node is None:
-                if self.max_nodes is not None and len(self.nodes) >= self.max_nodes:
-                    if not self._max_nodes_warning_emitted:
-                        print(
-                            f"[MCCFR] Warning: max_nodes {self.max_nodes} reached; skipping new nodes"
-                        )
-                        self._max_nodes_warning_emitted = True
+                if not self._ensure_capacity_for_new_node():
                     continue
                 self.nodes[info_state_key] = worker_node
                 continue
@@ -220,6 +231,85 @@ class MCCFRSolver:
         self.iterations += worker_iterations
         self.payoff_sum[0] += worker_payoff_sum[0]
         self.payoff_sum[1] += worker_payoff_sum[1]
+
+    def compress_memory(self):
+        """Quantize node values in memory to reduce RAM usage."""
+        if self.memory_quantize_dtype is None:
+            return
+        self._quantize_nodes_inplace(self.memory_quantize_dtype)
+
+    def _maybe_quantize_memory(self, iteration: int):
+        if self.memory_quantize_dtype is None or self.memory_quantize_interval <= 0:
+            return
+        if (
+            iteration - self._last_memory_quantize_iteration
+        ) < self.memory_quantize_interval:
+            return
+        self._quantize_nodes_inplace(self.memory_quantize_dtype)
+        self._last_memory_quantize_iteration = iteration
+
+    def _quantize_nodes_inplace(self, dtype):
+        cast = dtype
+        for node in self.nodes.values():
+            if not isinstance(node, NodeInfo):
+                continue
+            for action, value in list(node.regrets.items()):
+                node.regrets[action] = cast(value)
+            for action, value in list(node.strategy_sums.items()):
+                node.strategy_sums[action] = cast(value)
+
+    def _prune_low_visit_nodes(self, target_size: int) -> int:
+        before = len(self.nodes)
+        if target_size <= 0:
+            self.nodes = {}
+            return before
+        if before <= target_size:
+            return 0
+
+        heap = []
+        for key, node in self.nodes.items():
+            self._push_top_node(heap, target_size, key, node)
+        self.nodes = {key: node for _, key, node in heap}
+        return before - len(self.nodes)
+
+    def _prune_target_size(self) -> int:
+        if self.max_nodes is None:
+            return 0
+        ratio = self.prune_keep_ratio
+        if ratio <= 0:
+            ratio = 0.9
+        if ratio > 1:
+            ratio = 1.0
+        target = int(self.max_nodes * ratio)
+        if target >= self.max_nodes:
+            target = self.max_nodes - 1
+        return max(0, target)
+
+    def _emit_max_nodes_warning(self):
+        if not self._max_nodes_warning_emitted:
+            print(
+                f"[MCCFR] Warning: max_nodes {self.max_nodes} reached; skipping new nodes"
+            )
+            self._max_nodes_warning_emitted = True
+
+    def _ensure_capacity_for_new_node(self) -> bool:
+        if self.max_nodes is None:
+            return True
+        if len(self.nodes) < self.max_nodes:
+            return True
+
+        if self.prune_on_max_nodes:
+            target_size = self._prune_target_size()
+            removed = self._prune_low_visit_nodes(target_size)
+            if removed > 0:
+                print(
+                    f"[MCCFR] Pruned {removed} low-visit nodes; kept {len(self.nodes)}"
+                )
+            if len(self.nodes) < self.max_nodes:
+                return True
+
+        self._emit_max_nodes_warning()
+        return False
 
     def _mccfr_iteration(
         self, state, reach_probs: List[float], depth: int = 0
@@ -696,6 +786,10 @@ class FafnirMCCFRAI:
         auto_train: bool = False,
         max_depth: int = 512,
         max_nodes: Optional[int] = None,
+        prune_on_max_nodes: bool = False,
+        prune_keep_ratio: float = 0.9,
+        memory_quantize: Optional[str] = None,
+        memory_quantize_interval: int = 200,
         load_max_nodes: Optional[int] = None,
         load_dequantize: bool = False,
     ):
@@ -709,7 +803,13 @@ class FafnirMCCFRAI:
         """
         self.game_class = game_class
         self.solver = MCCFRSolver(
-            game_class, max_depth=max_depth, max_nodes=max_nodes
+            game_class,
+            max_depth=max_depth,
+            max_nodes=max_nodes,
+            prune_on_max_nodes=prune_on_max_nodes,
+            prune_keep_ratio=prune_keep_ratio,
+            memory_quantize=memory_quantize,
+            memory_quantize_interval=memory_quantize_interval,
         )
         self.model_path = model_path or "fafnir_mccfr_model.pkl"
 
@@ -726,6 +826,7 @@ class FafnirMCCFRAI:
                 max_nodes=load_max_nodes,
                 dequantize=load_dequantize,
             ):
+                self.solver.compress_memory()
                 print(
                     f"[MCCFR AI] Model loaded: {self.solver.iterations} iterations, {len(self.solver.nodes)} states"
                 )
@@ -857,6 +958,10 @@ def _mccfr_worker(job) -> Tuple[Dict[str, NodeInfo], int, List[float]]:
         exploration_bonus,
         max_depth,
         max_nodes,
+        prune_on_max_nodes,
+        prune_keep_ratio,
+        memory_quantize,
+        memory_quantize_interval,
         seed,
     ) = job
     if seed is not None:
@@ -869,6 +974,10 @@ def _mccfr_worker(job) -> Tuple[Dict[str, NodeInfo], int, List[float]]:
         exploration_bonus=exploration_bonus,
         max_depth=max_depth,
         max_nodes=max_nodes,
+        prune_on_max_nodes=prune_on_max_nodes,
+        prune_keep_ratio=prune_keep_ratio,
+        memory_quantize=memory_quantize,
+        memory_quantize_interval=memory_quantize_interval,
     )
     solver.run_mccfr(
         num_iterations=num_iterations, num_workers=1, show_progress=False
