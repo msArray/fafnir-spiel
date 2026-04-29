@@ -7,6 +7,7 @@ import asyncio
 import argparse
 import random
 from typing import Any, Dict, List, Optional
+from collections import defaultdict
 import socketio
 import sys
 import os
@@ -24,6 +25,10 @@ cfg = {"room": "room1", "name": "MCCFR-AI", "url": "http://127.0.0.1:8765"}
 my_index: Optional[int] = None
 last_state: Optional[Dict[str, Any]] = None
 ai_engine: Optional[FafnirMCCFRAI] = None
+
+# Opponent memory (kept in RAM only; persists across matches while running).
+opponent_memory: Dict[str, Dict[str, Any]] = {}
+_last_result_sig: Optional[tuple] = None
 
 # Anti-spam
 _action_lock = asyncio.Lock()
@@ -85,6 +90,116 @@ def my_ok_ready(st: Dict[str, Any]) -> bool:
 def offer_set(st: Dict[str, Any]) -> set:
     offer = safe_list(st.get("offer"))
     return set([x for x in offer if isinstance(x, str)])
+
+
+def _opponent_key(st: Dict[str, Any]) -> str:
+    ps = players_of(st)
+    if my_index is None or len(ps) < 2:
+        return "unknown"
+    opp_idx = 1 - my_index
+    opp_view = ps[opp_idx] if 0 <= opp_idx < len(ps) else {}
+    if isinstance(opp_view, dict):
+        name = opp_view.get("name")
+        if name:
+            return f"name:{name}"
+    return f"idx:{opp_idx}"
+
+
+def _get_opponent_stats(key: str) -> Dict[str, Any]:
+    stats = opponent_memory.get(key)
+    if stats is None:
+        stats = {
+            "turns": 0,
+            "sum_bid_size": 0,
+            "color_counts": defaultdict(int),
+        }
+        opponent_memory[key] = stats
+    return stats
+
+
+def _update_opponent_memory_from_state(st: Dict[str, Any]):
+    global _last_result_sig
+
+    if my_index is None:
+        return
+
+    last_result = st.get("last_result")
+    if not isinstance(last_result, dict) or not last_result:
+        return
+
+    bids_by_player = last_result.get("bids_by_player")
+    if not isinstance(bids_by_player, list) or len(bids_by_player) < 2:
+        return
+
+    # Avoid duplicate updates for the same resolved auction.
+    round_no = st.get("round")
+    turn_no = st.get("turn")
+    winner = last_result.get("winner")
+    sig = (
+        round_no,
+        turn_no,
+        winner,
+        tuple(tuple(x for x in (b or []) if isinstance(x, str)) for b in bids_by_player),
+    )
+    if sig == _last_result_sig:
+        return
+    _last_result_sig = sig
+
+    opp_idx = 1 - my_index
+    opp_bid_raw = bids_by_player[opp_idx] if 0 <= opp_idx < len(bids_by_player) else []
+    opp_bid = [x for x in (opp_bid_raw or []) if isinstance(x, str)]
+
+    stats = _get_opponent_stats(_opponent_key(st))
+    stats["turns"] += 1
+    stats["sum_bid_size"] += len(opp_bid)
+    for stone in opp_bid:
+        stats["color_counts"][stone] += 1
+
+
+def _target_bid_size_from_stats(stats: Dict[str, Any], max_size: int) -> Optional[int]:
+    turns = int(stats.get("turns") or 0)
+    if turns < 3:
+        return None
+    avg = float(stats.get("sum_bid_size") or 0.0) / max(1, turns)
+    target = int(round(avg))
+    if avg <= 1.2:
+        target += 1
+
+    min_size = 0 if ALLOW_EMPTY_BID else 1
+    return max(min_size, min(max_size, target))
+
+
+def _adjust_bid_by_opponent(hand: List[str], forbidden: set, bid: List[str], st: Dict[str, Any]) -> List[str]:
+    key = _opponent_key(st)
+    stats = opponent_memory.get(key)
+    if not stats:
+        return bid
+
+    candidates = [x for x in hand if x not in forbidden]
+    if not candidates:
+        return bid
+
+    target = _target_bid_size_from_stats(stats, len(candidates))
+    if target is None:
+        return bid
+
+    current = [x for x in bid if x in candidates]
+    if target == len(current):
+        return current
+
+    if target > len(current):
+        # Add stones from remaining candidates (multiset-aware).
+        available = candidates[:]
+        for stone in current:
+            if stone in available:
+                available.remove(stone)
+        need = min(target - len(current), len(available))
+        if need > 0:
+            current.extend(random.sample(available, need))
+        return current
+
+    # Trim if too large; keep as close to the current bid as possible.
+    return current[:target]
 
 
 def sanitize_bid(proposal: List[str], hand: List[str], forbidden: set) -> List[str]:
@@ -212,6 +327,8 @@ async def suggest_bid_with_mccfr(st: Dict[str, Any]) -> List[str]:
                 if candidates:
                     bid = [random.choice(candidates)]
 
+            bid = _adjust_bid_by_opponent(hand, forbidden, bid, st)
+
             print(
                 f"[MCCFR AI] Selected action -> proposal: {proposal} | bid: {bid}"
             )
@@ -230,7 +347,8 @@ async def suggest_bid_with_mccfr(st: Dict[str, Any]) -> List[str]:
         return []
 
     n = random.randint(1, min(2, len(candidates)))
-    return random.sample(candidates, n)
+    bid = random.sample(candidates, n)
+    return _adjust_bid_by_opponent(hand, forbidden, bid, st)
 
 
 async def do_submit_bid(st: Dict[str, Any], reason: str):
@@ -324,6 +442,14 @@ async def state_update(state):
     ph = phase_of(state)
     if ph not in ("RESULT", "ROUND_END"):
         _ok_sent_key = None
+
+    if ph == "GAME_END":
+        # Allow new games to be learned even if bids repeat.
+        global _last_result_sig
+        _last_result_sig = None
+        return
+
+    _update_opponent_memory_from_state(state)
 
 
 @sio.on("bid_rejected")
